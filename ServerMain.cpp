@@ -26,6 +26,7 @@ using namespace std;
 int portNumber;
 int sock;
 float PLP = 0;
+int randomSeed;
 
 struct clientArgs
 {
@@ -35,6 +36,8 @@ struct clientArgs
     int congestionState;
     int ssthreshold;
     int duplicateAck;
+    int congestionAvoidanceCounter;
+    bool drop[10000];
     pthread_mutex_t mutex;
     pthread_cond_t condVar;
     pthread_mutex_t send_mutex;
@@ -100,11 +103,12 @@ int main(int argc, char *argv[])
                 portNumber = stoi(line);
                 break;
             case 1:
-
+                randomSeed = stoi(line);
+                cout << randomSeed << endl;
                 break;
-
             case 2:
-                PLP = stoi(line);
+                PLP = stof(line);
+                cout << PLP << endl;
                 break;
             default:
                 break;
@@ -117,8 +121,13 @@ int main(int argc, char *argv[])
     if (sock < 0)
         error("socket failed!");
 
-    // int flags = fcntl(sock, F_GETFL, 0);
-    // fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    struct timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
+                   sizeof(timeout)) < 0)
+        error("setsockopt failed\n");
 
     struct sockaddr_in serverAddress;
     memset(&serverAddress, 0, sizeof(serverAddress));
@@ -209,7 +218,7 @@ void serveClient(int *port)
     pthread_t receiveAcksThread;
     struct clientArgs args;
     args.base = 0;
-    args.windowSize = 1;
+    args.windowSize = 2;
     args.nextPacket = 0;
     args.mutex = PTHREAD_MUTEX_INITIALIZER;
     args.condVar = PTHREAD_COND_INITIALIZER;
@@ -217,7 +226,12 @@ void serveClient(int *port)
     args.send_condVar = PTHREAD_COND_INITIALIZER;
     args.clientAddress = clientAddress;
     args.congestionState = SLOW_START;
-    pthread_create(&receiveAcksThread, NULL, receiveAcks, &args);
+    args.ssthreshold = 6;
+    args.congestionAvoidanceCounter = 0;
+    for (int i = 0; i < 10000; i++)
+    {
+        args.drop[i] = false;
+    }
 
     ifstream file;
     file.open(filePath, ios::in);
@@ -256,15 +270,38 @@ void serveClient(int *port)
         }
     }
 
+    int lostPacketsCount = PLP * args.packets.size();
+    srand(randomSeed);
+    for (int i = 0; i < lostPacketsCount; i++)
+    {
+        int r = rand() % args.packets.size();
+        while (args.drop[r] || r == 0)
+        {
+            r = rand() % args.packets.size();
+        }
+        args.drop[r] = true;
+    }
+
+    pthread_create(&receiveAcksThread, NULL, receiveAcks, &args);
+
     while (1)
     {
         sleep(1);
         pthread_mutex_lock(&args.mutex);
         if (args.windowSize > args.nextPacket - args.base &&
-         args.nextPacket < args.packets.size())
+            args.nextPacket < args.packets.size())
         {
-            sendto(sock, &args.packets[args.nextPacket], sizeof(dataPacket), 0, (struct sockaddr *)&clientAddress, sizeof(clientAddress));
-            cout << args.nextPacket << " data sent" << endl;
+            if (!args.drop[args.nextPacket])
+            {
+                sendto(sock, &args.packets[args.nextPacket], sizeof(dataPacket), 0, (struct sockaddr *)&clientAddress, sizeof(clientAddress));
+                cout << args.nextPacket << " data sent" << endl;
+            }
+            else
+            {
+                cout << args.nextPacket << " "
+                     << "DROPPED" << endl;
+                args.drop[args.nextPacket] = false;
+            }
             pthread_cond_signal(&args.send_condVar);
             args.nextPacket++;
         }
@@ -305,37 +342,77 @@ void *receiveAcks(void *arg)
         {
             cout << "*******TIMEOUT********" << endl;
             pthread_mutex_lock(&args->mutex);
-            args->ssthreshold = args->windowSize / 2;
-            args->windowSize = 1;
+            args->ssthreshold = max(args->windowSize / 2, 2);
+            args->windowSize = 2;
             args->duplicateAck = 0;
             args->nextPacket = args->base;
+            args->congestionState = SLOW_START;
             pthread_mutex_unlock(&args->mutex);
         }
         else
         {
             // cout << "receiving" << endl;
             ssize_t numBytes = recvfrom(sock, &ack, sizeof(ackPacket), 0, (struct sockaddr *)&args->clientAddress, &clientAddrlen);
-            cout << ack.ackno << " " << ack.len << " " << args->nextPacket << endl;
+            cout << ack.ackno << " " << args->nextPacket << endl;
             if (ack.len == 8 && !corruptedAck(ack) && ack.ackno <= args->base + args->windowSize)
             {
                 cout << "recv" << endl;
                 pthread_mutex_lock(&args->mutex);
-                args->base = ack.ackno;
-                cout << "base: " << args->base << endl;
+                cout << "old base"<<args->base << endl;
+                if (ack.ackno == args->base)
+                {
+                    args->duplicateAck++;
+                    if (args->duplicateAck == 3)
+                    {
+                        cout << "********THREE DUPLICATE ACKS************" << endl;
+                        args->ssthreshold = args->windowSize / 2;
+                        args->windowSize = args->ssthreshold + 1;
+                        args->congestionState = FAST_RECOVERY;
+                        args->nextPacket = args->base;
+                    }
+                }
+                else
+                {
+                    args->duplicateAck = 0;
+                }
                 switch (args->congestionState)
                 {
                 case SLOW_START:
-                    args->windowSize++;
+                    if (args->base != ack.ackno)
+                    {
+                        args->windowSize += (ack.ackno - args->base);
+                    }
                     if (args->windowSize >= args->ssthreshold)
+                    {
                         args->congestionState = CONGESTION_AVOIDANCE;
-                    cout << "window: " << args->windowSize << endl;
+                        args->congestionAvoidanceCounter = 0;
+                    }
                     break;
                 case CONGESTION_AVOIDANCE:
-
+                    if (args->base != ack.ackno)
+                    {
+                        args->congestionAvoidanceCounter += (ack.ackno - args->base);
+                        if (args->congestionAvoidanceCounter == args->windowSize)
+                            args->windowSize++;
+                    }
                     break;
                 case FAST_RECOVERY:
+                    if (args->duplicateAck = 0)
+                    {
+                        args->congestionState = CONGESTION_AVOIDANCE;
+                        args->congestionAvoidanceCounter = 0;
+                        args->windowSize = args->ssthreshold;
+                    }
+                    else
+                    {
+                        args->windowSize++;
+                    }
                     break;
                 }
+                args->base = ack.ackno;
+                cout << "base: " << args->base << endl;
+                cout << "state " << args->congestionState << endl;
+                cout << "window: " << args->windowSize << endl;
                 pthread_mutex_unlock(&args->mutex);
                 cout << "ACKED " << ack.ackno << endl;
             }
@@ -348,6 +425,7 @@ void *receiveAcks(void *arg)
 
 void dataCheckSum(struct dataPacket *packet)
 {
+
 }
 void ackCheckSum(struct ackPacket *packet)
 {
